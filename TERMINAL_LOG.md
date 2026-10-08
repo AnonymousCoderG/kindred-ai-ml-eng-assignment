@@ -85,7 +85,7 @@ tests\test_sessions.py ..                                                [100%]
 E       AssertionError: assert 'chronic condition' not in 'Because nee...iness match.'
 E         
 E         'chronic condition' is contained here:
-E           Because needs a CFO and has a chronic condition; offers CFO services — a good business match.
+E           Because needs a CFO and has a chronic condition; offers CFO services ï¿½ a good business match.
 E         ?                               +++++++++++++++++
 
 tests\test_club_isolation.py:124: AssertionError
@@ -688,6 +688,7 @@ tests\test_sessions.py ..                                                [100%]
 
 
 ## Part 3: eval run (real API)
+Note: this ran during a provider 429 outage. The eval scored it 0/12 until I changed it to report INCONCLUSIVE (exit code 2) for outages. See .ai-conversations/05-eval-and-outage-handling.md.
 
 LLM attempt 1/5 failed (rate limited or timed out (429): {"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"google/gemma-4-31b-it:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate you); retrying in 0.7s
 LLM attempt 2/5 failed (rate limited or timed out (429): {"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"google/gemma-4-31b-it:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate you); retrying in 1.9s
@@ -867,7 +868,8 @@ tests\test_sessions.py ..                                                [100%]
 
 
 
-## Part 3: matching AFTER fix (member 5 no longer ranked)
+## Part 3: matching AFTER fix
+Note: member 5 still appears because extraction (message 14) later gave that member a non-restricted attribute; the restricted text is excluded from ranking. tests/test_matching_restricted.py asserts the embedder never receives restricted text.
 
 [
     {

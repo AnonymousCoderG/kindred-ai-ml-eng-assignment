@@ -99,7 +99,7 @@ Two real charges were made, and the session shows no booking.
 
 **Trace**
 
-Requests (new turns on the same session, `riverside-member-1`):
+Requests (session 2, `riverside-member-1`; `/sessions/2/turn` for each):
 ```
 POST /sessions/1/turn  {"intent":"book","party_size":2}
 POST /sessions/1/turn  {"intent":"refund_dispute"}
@@ -109,7 +109,7 @@ Responses:
 ```
 {"status":"awaiting_confirmation","party_size":2}
 {"status":"escalated"}
-{"status":"confirmed","booking_id":3}
+{"status":"confirmed","booking_id":4}
 ```
 
 ---
@@ -165,6 +165,15 @@ Response (all four charges were made by riverside members):
 - **Severity:** Medium
 - **Description:** `build_member_profile_text` joins every attribute regardless of `restricted`, and the stored profile embeddings were built that way, so health and anxiety text influences who gets suggested as a match.
 - **Recommended fix:** Build the profile text from non-restricted attributes only, and recompute the embedding when ranking.
+- **Status:** Fixed in Part 3 (`app/scoping.py` `_matchable`, `matching_service.py`); tests in `tests/test_matching_restricted.py`.
+
+**Trace**
+
+Request (BEFORE the fix, a riverside member asks for candidates; the ranking is computed from stored profile embeddings that include restricted text):
+```
+curl -H "X-Member-Token: riverside-member-1" "http://localhost:8000/members/3/candidates?reason=business"
+```
+Response: ranked list including member 5, whose only attribute is restricted (see `TERMINAL_LOG.md`, "matching BEFORE fix"). After the fix the ranking is computed from non-restricted text only (see "matching AFTER fix"); `test_matching_restricted.py` asserts the embedder never receives restricted text.
 
 ---
 
@@ -175,3 +184,5 @@ Response (all four charges were made by riverside members):
 - **Severity:** Low
 - **Description:** The requesting member's attributes are queried and embedded again for every candidate inside the loop, instead of once before it.
 - **Recommended fix:** Compute the query vector once before the loop.
+- **Status:** Fixed in Part 3 (requester embedded once).
+- **Evidence:** No request trace; found by reading the code (`matching_service.py:32-35`).
