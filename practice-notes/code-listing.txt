@@ -1,0 +1,291 @@
+     1	from fastapi import Depends, Header, HTTPException
+     2	from sqlalchemy.orm import Session
+     3	
+     4	from app.db import get_db
+     5	from app.models import Member
+     6	
+     7	
+     8	def get_current_member(
+     9	    x_member_token: str = Header(..., alias="X-Member-Token"),
+    10	    db: Session = Depends(get_db),
+    11	) -> Member:
+    12	    member = db.query(Member).filter(Member.token == x_member_token).first()
+    13	    if not member:
+    14	        raise HTTPException(status_code=401, detail="invalid member token")
+    15	    return member
+    16	
+    17	
+    18	def require_admin(member: Member = Depends(get_current_member)) -> Member:
+    19	    if member.role != "admin":
+    20	        raise HTTPException(status_code=403, detail="admin role required")
+    21	    return member
+    22	from sqlalchemy.orm import Session as DbSession
+    23	
+    24	from app.models import Booking, ConversationSession, PaymentAttempt
+    25	from app.services.payment_mock import payment_mock_client
+    26	
+    27	
+    28	class SimulatedCrash(Exception):
+    29	    """Lets a caller reproduce a process crash between the charge succeeding
+    30	    and the session/booking being persisted — the same ambiguous-outcome
+    31	    scenario as a real payment-provider timeout, but deterministic to trigger."""
+    32	
+    33	
+    34	def advance_turn(session: ConversationSession, intent: str, payload: dict, db: DbSession) -> dict:
+    35	    if intent == "refund_dispute":
+    36	        session.status = "escalated"
+    37	        db.commit()
+    38	        return {"status": "escalated"}
+    39	
+    40	    if intent == "book":
+    41	        party_size = payload.get("party_size")
+    42	        if party_size is not None:
+    43	            session.party_size = party_size
+    44	        if session.party_size is not None:
+    45	            session.awaiting_confirmation = True
+    46	        db.commit()
+    47	        return {
+    48	            "status": "awaiting_confirmation" if session.awaiting_confirmation else "need_party_size",
+    49	            "party_size": session.party_size,
+    50	        }
+    51	
+    52	    if intent == "affirm" and session.awaiting_confirmation:
+    53	        amount_cents = payload.get("amount_cents", 0)
+    54	
+    55	        # No check here for a prior successful charge on this session, and
+    56	        # nothing is persisted before the charge happens.
+    57	        result = payment_mock_client.charge(amount_cents)
+    58	
+    59	        if payload.get("simulate_crash"):
+    60	            raise SimulatedCrash("process died after the charge, before the session/booking were saved")
+    61	
+    62	        booking = Booking(
+    63	            member_id=session.member_id,
+    64	            club_id=session.club_id,
+    65	            description="Session-confirmed booking",
+    66	            amount_cents=amount_cents,
+    67	            status="confirmed" if result.status == "succeeded" else "pending",
+    68	        )
+    69	        db.add(booking)
+    70	        db.flush()
+    71	        db.add(PaymentAttempt(booking_id=booking.id, amount_cents=amount_cents, status=result.status))
+    72	        session.booking_id = booking.id
+    73	        session.status = "confirmed"
+    74	        session.awaiting_confirmation = False
+    75	        db.commit()
+    76	        return {"status": "confirmed", "booking_id": booking.id}
+    77	
+    78	    return {"status": session.status}
+    79	import math
+    80	
+    81	from sqlalchemy.orm import Session
+    82	
+    83	from app.embeddings import embedding_client
+    84	from app.models import Member, MemberAttribute
+    85	
+    86	
+    87	def build_member_profile_text(member: Member, db: Session) -> str:
+    88	    attrs = db.query(MemberAttribute).filter(MemberAttribute.member_id == member.id).all()
+    89	    # NOTE: this joins every attribute regardless of its `restricted` flag.
+    90	    return " | ".join(a.text for a in attrs)
+    91	
+    92	
+    93	def cosine_similarity(a: list[float], b: list[float]) -> float:
+    94	    dot = sum(x * y for x, y in zip(a, b))
+    95	    norm_a = math.sqrt(sum(x * x for x in a))
+    96	    norm_b = math.sqrt(sum(y * y for y in b))
+    97	    if norm_a == 0 or norm_b == 0:
+    98	        return 0.0
+    99	    return dot / (norm_a * norm_b)
+   100	
+   101	
+   102	def rank_candidates(member: Member, reason: str, db: Session) -> list[dict]:
+   103	    candidates = (
+   104	        db.query(Member)
+   105	        .filter(Member.club_id == member.club_id, Member.id != member.id)
+   106	        .all()
+   107	    )
+   108	
+   109	    results = []
+   110	    for candidate in candidates:
+   111	        # Recomputes the requesting member's own embedding on every iteration
+   112	        # via embedding_client.embed(), instead of once before the loop.
+   113	        query_vec = embedding_client.embed(build_member_profile_text(member, db))
+   114	        candidate_vec = candidate.profile_embedding
+   115	        if candidate_vec is None:
+   116	            continue
+   117	        score = cosine_similarity(query_vec, [float(v) for v in candidate_vec])
+   118	        results.append({"member_id": candidate.id, "name": candidate.name, "score": round(float(score), 4)})
+   119	
+   120	    results.sort(key=lambda r: -r["score"])
+   121	    return results
+   122	from datetime import datetime
+   123	
+   124	from pgvector.sqlalchemy import Vector
+   125	from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, func
+   126	from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+   127	
+   128	from app.config import settings
+   129	
+   130	
+   131	class Base(DeclarativeBase):
+   132	    pass
+   133	
+   134	
+   135	class Club(Base):
+   136	    __tablename__ = "clubs"
+   137	
+   138	    id: Mapped[str] = mapped_column(String, primary_key=True)
+   139	    name: Mapped[str] = mapped_column(String, nullable=False)
+   140	
+   141	
+   142	class Member(Base):
+   143	    __tablename__ = "members"
+   144	
+   145	    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+   146	    club_id: Mapped[str] = mapped_column(ForeignKey("clubs.id"), nullable=False)
+   147	    name: Mapped[str] = mapped_column(String, nullable=False)
+   148	    email: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+   149	    token: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+   150	    role: Mapped[str] = mapped_column(String, nullable=False, default="member")
+   151	    profile_embedding = mapped_column(Vector(settings.embed_dim), nullable=True)
+   152	
+   153	
+   154	class ConversationMessage(Base):
+   155	    __tablename__ = "conversation_messages"
+   156	
+   157	    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+   158	    member_id: Mapped[int] = mapped_column(ForeignKey("members.id"), nullable=False)
+   159	    club_id: Mapped[str] = mapped_column(ForeignKey("clubs.id"), nullable=False)
+   160	    body: Mapped[str] = mapped_column(String, nullable=False)
+   161	    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+   162	
+   163	
+   164	class MemberAttribute(Base):
+   165	    __tablename__ = "member_attributes"
+   166	
+   167	    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+   168	    member_id: Mapped[int] = mapped_column(ForeignKey("members.id"), nullable=False)
+   169	    club_id: Mapped[str] = mapped_column(ForeignKey("clubs.id"), nullable=False)
+   170	    kind: Mapped[str] = mapped_column(String, nullable=False)  # need | offer | context | interest
+   171	    text: Mapped[str] = mapped_column(String, nullable=False)
+   172	    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=0.5)
+   173	    restricted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+   174	    source_message_id: Mapped[int | None] = mapped_column(ForeignKey("conversation_messages.id"), nullable=True)
+   175	    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+   176	
+   177	
+   178	class KnowledgeChunk(Base):
+   179	    __tablename__ = "knowledge_chunks"
+   180	
+   181	    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+   182	    club_id: Mapped[str] = mapped_column(ForeignKey("clubs.id"), nullable=False)
+   183	    title: Mapped[str] = mapped_column(String, nullable=False)
+   184	    body: Mapped[str] = mapped_column(String, nullable=False)
+   185	    embedding = mapped_column(Vector(settings.embed_dim), nullable=False)
+   186	
+   187	
+   188	class Booking(Base):
+   189	    __tablename__ = "bookings"
+   190	
+   191	    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+   192	    member_id: Mapped[int] = mapped_column(ForeignKey("members.id"), nullable=False)
+   193	    club_id: Mapped[str] = mapped_column(ForeignKey("clubs.id"), nullable=False)
+   194	    description: Mapped[str] = mapped_column(String, nullable=False)
+   195	    amount_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+   196	    status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
+   197	
+   198	
+   199	class ConversationSession(Base):
+   200	    __tablename__ = "conversation_sessions"
+   201	
+   202	    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+   203	    member_id: Mapped[int] = mapped_column(ForeignKey("members.id"), nullable=False)
+   204	    club_id: Mapped[str] = mapped_column(ForeignKey("clubs.id"), nullable=False)
+   205	    party_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+   206	    awaiting_confirmation: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+   207	    status: Mapped[str] = mapped_column(String, nullable=False, default="active")  # active | escalated | confirmed
+   208	    booking_id: Mapped[int | None] = mapped_column(ForeignKey("bookings.id"), nullable=True)
+   209	    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+   210	
+   211	
+   212	class PaymentAttempt(Base):
+   213	    __tablename__ = "payment_attempts"
+   214	
+   215	    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+   216	    booking_id: Mapped[int] = mapped_column(ForeignKey("bookings.id"), nullable=False)
+   217	    idempotency_key: Mapped[str | None] = mapped_column(String, nullable=True)
+   218	    amount_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+   219	    status: Mapped[str] = mapped_column(String, nullable=False)
+   220	    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+   221	from pydantic import BaseModel
+   222	
+   223	
+   224	class ConfirmPaymentIn(BaseModel):
+   225	    amount_cents: int
+   226	from dataclasses import dataclass
+   227	
+   228	from app.config import settings
+   229	
+   230	
+   231	class PaymentTimeoutError(Exception):
+   232	    """Raised when the (mock) payment provider times out with an ambiguous
+   233	    response — the caller does not know whether the charge went through."""
+   234	
+   235	
+   236	@dataclass
+   237	class ChargeResult:
+   238	    status: str  # "succeeded" | "failed"
+   239	
+   240	
+   241	class PaymentMockClient:
+   242	    def __init__(self) -> None:
+   243	        # Every attempted charge, in order — a stand-in for the provider's own
+   244	        # ledger, useful for proving a bug caused two real-world charges.
+   245	        self.charge_log: list[int] = []
+   246	
+   247	    def charge(self, amount_cents: int) -> ChargeResult:
+   248	        self.charge_log.append(amount_cents)
+   249	        if amount_cents == settings.payment_timeout_trigger_cents:
+   250	            raise PaymentTimeoutError("provider timed out")
+   251	        if amount_cents <= 0:
+   252	            return ChargeResult(status="failed")
+   253	        return ChargeResult(status="succeeded")
+   254	
+   255	
+   256	payment_mock_client = PaymentMockClient()
+   257	"""Interface for Part 3's extraction pipeline.
+   258	
+   259	Nothing in this file calls a real API. You implement a real client against
+   260	the LLM provider of your choice (OpenAI, Anthropic, or equivalent) for the
+   261	actual pipeline. FakeLLMClient below is provided only so your own unit tests
+   262	don't need a real API key or network access.
+   263	"""
+   264	
+   265	from typing import Protocol, TypedDict
+   266	
+   267	
+   268	class ExtractedAttribute(TypedDict):
+   269	    kind: str  # need | offer | context | interest
+   270	    text: str
+   271	    confidence: float
+   272	    restricted: bool
+   273	
+   274	
+   275	class LLMClient(Protocol):
+   276	    def extract_attributes(self, message_text: str) -> list[ExtractedAttribute]:
+   277	        """Extract structured attributes from one raw member message."""
+   278	        ...
+   279	
+   280	
+   281	class FakeLLMClient:
+   282	    """Trivial test double — does not call any real API."""
+   283	
+   284	    def __init__(self, canned_response: list[ExtractedAttribute] | None = None) -> None:
+   285	        self.canned_response = canned_response or []
+   286	        self.calls: list[str] = []
+   287	
+   288	    def extract_attributes(self, message_text: str) -> list[ExtractedAttribute]:
+   289	        self.calls.append(message_text)
+   290	        return self.canned_response
+DATABASE_URL=postgresql+psycopg://kindred:kindred@localhost:5432/kindred
